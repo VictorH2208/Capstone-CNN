@@ -15,64 +15,25 @@ from .util import get_project_root_dir
 
 # # Configure the logging module
 # logging.basicConfig(level=logging.WARNING, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-# # logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
 # # Create a logger
 _logger = logging.getLogger(__name__)
 
-# # Create a console handler and set the level to DEBUG
-# console_handler = logging.StreamHandler()
-# console_handler.setLevel(logging.DEBUG)
+# # Create a console handler and set the level to INFO
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
 
 # # Create a formatter and set it for the console handler
-# formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-# console_handler.setFormatter(formatter)
+formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+console_handler.setFormatter(formatter)
 
 # # Add the console handler to the logger
 # _logger.addHandler(console_handler)
 
 
 # All lung IDs
-ALL_LUNG_IDS = (
-    1,
-    2,
-    3,
-    4,
-    5,
-    6,
-    7,
-    8,
-    9,
-    10,
-    11,
-    12,
-    13,
-    14,
-    579,
-    595,
-    598,
-    600,
-    603,
-    606,
-    607,
-    610,
-    615,
-    616,
-    617,
-    618,
-    619,
-    682,
-    698,
-    731,
-    735,
-    738,
-    753,
-    762,
-    782,
-    803,
-    817,
-    818,
-)
+ALL_LUNG_IDS = tuple(range(1, 61))
 
 
 class BreathLabel(Enum):
@@ -99,7 +60,7 @@ class RawEVLPDataset(Dataset):
 
         Lung_id: int
         Breath_num: np.ndarray
-        P_peak: np.ndarray
+        P_peak: Optional[np.ndarray]
         Dy_comp: np.ndarray
         Label: np.ndarray
         Max_gap: Optional[np.ndarray]
@@ -155,13 +116,14 @@ class RawEVLPDataset(Dataset):
         return {
             "Lung_id": lung_id,
             # Required fields
-            **{column_name: df[column_name].to_numpy() for column_name in ("Breath_num", "P_peak", "Dy_comp")},
-            "Label": pd.Categorical(df["Label"], [label.name for label in BreathLabel], ordered=True).codes,
+            **{column_name: df[column_name].to_numpy() for column_name in ("Breath_num", "Dy_comp")},
+            "Label": pd.Categorical(df["Label"], [label.name for label in BreathLabel], ordered=True).codes.copy(),
             # Optional fields
             **{
                 stripped_column_name: (df[raw_column_name].to_numpy() if raw_column_name in df else None)
                 # Parentheses must be stripped off because of invalid variable names
                 for raw_column_name, stripped_column_name in {
+                    "P_peak": "P_peak",
                     "Max_gap(ms)": "Max_gap",
                     "In_vol(ml)": "In_vol",
                     "Ex_vol(ml)": "Ex_vol",
@@ -186,7 +148,7 @@ class ProcessedEVLPDataset(Dataset):
         # The following fields are copied from `RawEVLPDataset.Element`
         Lung_id: int
         Breath_num: np.ndarray
-        P_peak: np.ndarray
+        P_peak: Optional[np.ndarray]
         Dy_comp: np.ndarray
         Label: np.ndarray
         Max_gap: Optional[np.ndarray]
@@ -242,6 +204,32 @@ def process_raw_dataset_element(
     3. Remove points of other labels
     4. Segment the series into multiple elements
     """
+    COUNTER_THRESHOLD = 6
+    # mark any consecutive labels whose length is less than COUNTER_THRESHOLD as Noise
+    counter = 1
+
+    # Iterate over the labels
+    for i in range(1, len(raw_element["Label"])):
+        if raw_element["Label"][i] == raw_element["Label"][i - 1]:
+            counter += 1
+        else:
+            if counter < COUNTER_THRESHOLD:
+                _logger.debug("Lung_id %d: marking %d to %d as noise", raw_element["Lung_id"], i - counter, i)
+                for j in range(i - counter, i):
+                    raw_element["Label"][j] = BreathLabel.Noise.value
+            counter = 1
+
+    if counter < COUNTER_THRESHOLD:
+        _logger.debug("Lung_id %d: marking %d to %d as noise", raw_element["Lung_id"], len(raw_element["Label"]) - counter, len(raw_element["Label"]))
+        for j in range(len(raw_element["Label"]) - counter, len(raw_element["Label"])):
+            raw_element["Label"][j] = BreathLabel.Noise.value
+
+    # mark COUNTER_THRESHOLD labels after bronch as Noise
+    for i in range(len(raw_element["Label"] - COUNTER_THRESHOLD)):
+        if raw_element["Label"][i] == BreathLabel.Bronch.value and raw_element["Label"][i + 1] != BreathLabel.Bronch.value:
+            _logger.debug("Lung_id %d: marking %d to %d as bronch", raw_element["Lung_id"], i, i + COUNTER_THRESHOLD)
+            raw_element["Label"][i : i + COUNTER_THRESHOLD] = BreathLabel.Noise.value
+
     indexes_raw_normal = np.nonzero(raw_element["Label"] == BreathLabel.Normal.value)[0]
     indexes_raw_assessment = np.nonzero(raw_element["Label"] == BreathLabel.Assessment.value)[0]
 
@@ -290,27 +278,42 @@ def process_raw_dataset_element(
             # skip consecutive labels
             if index == label_index_next - 1:
                 continue
-            # if there is an bronch or assessment/normal label, delete the points between them
+            # skip if there is an bronch or assessment/normal label
             if (processed_element["Label"][index + 1 : label_index_next] == skip_label.value).any() or (processed_element["Label"][index + 1 : label_index_next] == BreathLabel.Bronch.value).any():
-                _logger.debug("Lung_id %d: Interpolation: delete starting from %d", processed_element["Lung_id"], index)
                 continue
 
-            for key in raw_element.keys():
+            for key in processed_element.keys():
+                if key == "Breath_num" or key.startswith("Is_"):
+                    continue
                 # linear interpolate
-                if raw_element[key] is not None and isinstance(raw_element[key], np.ndarray) and key != "Label":
-                    start = raw_element[key][index]
-                    end = raw_element[key][label_index_next]
-                    _logger.debug("Lung_id %d: Interpolation: between %d: %f and %d: %f", processed_element["Lung_id"], index, start, label_index_next, end)
+                if processed_element[key] is not None and isinstance(processed_element[key], np.ndarray) and key != "Label":
+                    start = processed_element[key][index]
+                    end = processed_element[key][label_index_next]
+                    if end - start > 4 * (label_index_next - index):
+                        _logger.info(
+                            "Lung_id %d: Interpolation %s: between %d and %d: %f, %f",
+                            processed_element["Lung_id"],
+                            key,
+                            index + index_min,
+                            label_index_next + index_min,
+                            start,
+                            end,
+                        )
                     diff = (end - start) / (label_index_next - index)
                     for j in range(index + 1, label_index_next):
                         processed_element[key][j] = processed_element[key][j - 1] + diff
                         processed_element[is_label][j] = 1
 
     # Remove points of other labels
-    for key in raw_element.keys():
-        if raw_element[key] is not None and isinstance(raw_element[key], np.ndarray) and key != "Label":
+    for key in processed_element.keys():
+        if processed_element[key] is not None and isinstance(processed_element[key], np.ndarray) and key != "Label":
             processed_element[key] = processed_element[key].astype(float)
-            processed_element[key][np.logical_and(processed_element["Is_normal"] != 1, processed_element["Is_assessment"] != 1)] = np.nan
+            processed_element[key][
+                np.logical_and(
+                    processed_element["Is_normal"] != 1,
+                    processed_element["Is_assessment"] != 1,
+                )
+            ] = np.nan
 
     indexes_normal_index = 0
     indexes_assessment_index = 0
@@ -321,7 +324,12 @@ def process_raw_dataset_element(
         while index > indexes_assessment[indexes_assessment_index] and indexes_assessment_index < len(indexes_assessment) - 1:
             indexes_assessment_index += 1
         if indexes_assessment_index != 0 and indexes_normal_index != 0:
-            processed_element["Is_bronch"][max(indexes_normal[indexes_normal_index - 1], indexes_assessment[indexes_assessment_index - 1])] = 1
+            processed_element["Is_bronch"][
+                max(
+                    indexes_normal[indexes_normal_index - 1],
+                    indexes_assessment[indexes_assessment_index - 1],
+                )
+            ] = 1
         elif indexes_assessment_index != 0:
             processed_element["Is_bronch"][indexes_assessment[indexes_assessment_index - 1]] = 1
         elif indexes_normal_index != 0:
@@ -331,8 +339,8 @@ def process_raw_dataset_element(
     processed_element["Is_normal"] = processed_element["Is_normal"][~np.isnan(processed_element["Dy_comp"])]
     processed_element["Is_assessment"] = processed_element["Is_assessment"][~np.isnan(processed_element["Dy_comp"])]
     processed_element["Is_bronch"] = processed_element["Is_bronch"][~np.isnan(processed_element["Dy_comp"])]
-    for key in raw_element.keys():
-        if raw_element[key] is not None and isinstance(raw_element[key], np.ndarray) and key != "Label":
+    for key in processed_element.keys():
+        if processed_element[key] is not None and isinstance(processed_element[key], np.ndarray) and key != "Label":
             processed_element[key] = processed_element[key][~np.isnan(processed_element[key])]
 
     processed_elements = []

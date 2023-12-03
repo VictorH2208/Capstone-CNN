@@ -1,0 +1,26 @@
+name: mie429
+channels:
+  - nvidia
+  - pytorch
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.10
+  - pip
+  - black
+  - black-jupyter
+  - ipywidgets
+  - isort
+  - jupyter
+  - matplotlib
+  - optuna
+  - pandas
+  - pylint
+  - pytorch
+  - pytorch-cuda=12.1
+  - scikit-learn
+  - scipy
+  - tensorboard
+  - torchaudio
+  - torchvision
+  - tqdm
